@@ -24,7 +24,6 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -48,53 +47,9 @@ _is_ready = False
 _request_count = 0
 _error_count = 0
 
-# ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
-# ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
-
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
-
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
-
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
-
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
+from app.auth import verify_api_key
+from app.rate_limiter import check_rate_limit, r as redis_client
+from app.cost_guard import check_and_record_cost
 
 # ─────────────────────────────────────────────────────────
 # Lifespan
@@ -166,11 +121,14 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
                           description="Your question for the agent")
 
+    user_id: str = Field(..., description="Unique identifier for the user to map conversation history")
+
 class AskResponse(BaseModel):
     question: str
     answer: str
     model: str
     timestamp: str
+    history_length: int = 0
 
 # ─────────────────────────────────────────────────────────
 # Endpoints
@@ -206,7 +164,7 @@ async def ask_agent(
 
     # Budget check
     input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+    check_and_record_cost(_key[:8], input_tokens, 0)
 
     logger.info(json.dumps({
         "event": "agent_call",
@@ -216,14 +174,27 @@ async def ask_agent(
 
     answer = llm_ask(body.question)
 
+    # Store history in Redis (stateless interaction history)
+    history_len = 0
+    if redis_client:
+        history_key = f"chat_history:{body.user_id}"
+        # Push to list: User's question
+        redis_client.rpush(history_key, f"User: {body.question}")
+        redis_client.rpush(history_key, f"Agent: {answer}")
+        
+        # Keep only the last 20 interactions as history
+        redis_client.ltrim(history_key, -20, -1)
+        history_len = redis_client.llen(history_key)
+
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    check_and_record_cost(_key[:8], 0, output_tokens)
 
     return AskResponse(
         question=body.question,
         answer=answer,
         model=settings.llm_model,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        history_length=history_len,
     )
 
 
@@ -248,20 +219,12 @@ def ready():
     """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
         raise HTTPException(503, "Not ready")
+    if redis_client:
+        try:
+            redis_client.ping()
+        except Exception:
+            raise HTTPException(503, "Redis not ready")
     return {"ready": True}
-
-
-@app.get("/metrics", tags=["Operations"])
-def metrics(_key: str = Depends(verify_api_key)):
-    """Basic metrics (protected)."""
-    return {
-        "uptime_seconds": round(time.time() - START_TIME, 1),
-        "total_requests": _request_count,
-        "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
-    }
 
 
 # ─────────────────────────────────────────────────────────
